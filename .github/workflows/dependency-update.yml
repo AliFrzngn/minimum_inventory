@@ -1,0 +1,169 @@
+name: Dependency Updates
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Run every Monday at 9 AM
+  workflow_dispatch:
+
+jobs:
+  update-dependencies:
+    name: Update Dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    # Update Python dependencies
+    - name: Update Python Dependencies
+      working-directory: ./backend
+      run: |
+        python -m pip install --upgrade pip
+        pip install pip-tools
+        pip-compile --upgrade requirements.in || pip-compile requirements.txt --upgrade
+        pip install -r requirements.txt
+
+    # Update Node.js dependencies
+    - name: Update Node.js Dependencies
+      working-directory: ./frontend
+      run: |
+        npm update
+        npm audit fix --force || true
+
+    - name: Check for Updates
+      id: check-updates
+      run: |
+        if git diff --quiet; then
+          echo "no-updates=true" >> $GITHUB_OUTPUT
+        else
+          echo "no-updates=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Pull Request
+      if: steps.check-updates.outputs.no-updates == 'false'
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit-message: 'chore: update dependencies'
+        title: 'chore: update dependencies'
+        body: |
+          This PR updates project dependencies to their latest versions.
+          
+          ## Changes
+          - Updated Python dependencies in `backend/requirements.txt`
+          - Updated Node.js dependencies in `frontend/package.json` and `frontend/package-lock.json`
+          
+          ## Testing
+          - [ ] All tests pass
+          - [ ] No breaking changes introduced
+          - [ ] Security vulnerabilities addressed
+        branch: dependency-updates
+        delete-branch: true
+
+  security-updates:
+    name: Security Updates
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install Dependencies
+      working-directory: ./backend
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install safety
+
+    - name: Install Frontend Dependencies
+      working-directory: ./frontend
+      run: npm ci
+
+    - name: Check Python Security
+      working-directory: ./backend
+      run: |
+        safety check --json --output safety-report.json || true
+        if [ -s safety-report.json ]; then
+          echo "Security vulnerabilities found in Python dependencies"
+          cat safety-report.json
+        fi
+
+    - name: Check Node.js Security
+      working-directory: ./frontend
+      run: |
+        npm audit --audit-level=moderate --json > npm-audit-report.json || true
+        if [ -s npm-audit-report.json ]; then
+          echo "Security vulnerabilities found in Node.js dependencies"
+          cat npm-audit-report.json
+        fi
+
+    - name: Create Security Issue
+      if: failure()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let body = 'Security vulnerabilities detected in dependencies:\n\n';
+          
+          try {
+            const safetyReport = JSON.parse(fs.readFileSync('backend/safety-report.json', 'utf8'));
+            if (safetyReport.length > 0) {
+              body += '## Python Dependencies\n';
+              safetyReport.forEach(vuln => {
+                body += `- **${vuln.package}**: ${vuln.vulnerability}\n`;
+              });
+              body += '\n';
+            }
+          } catch (e) {
+            console.log('No Python security issues found');
+          }
+          
+          try {
+            const npmReport = JSON.parse(fs.readFileSync('frontend/npm-audit-report.json', 'utf8'));
+            if (npmReport.vulnerabilities && Object.keys(npmReport.vulnerabilities).length > 0) {
+              body += '## Node.js Dependencies\n';
+              Object.values(npmReport.vulnerabilities).forEach(vuln => {
+                body += `- **${vuln.name}**: ${vuln.title}\n`;
+              });
+            }
+          } catch (e) {
+            console.log('No Node.js security issues found');
+          }
+          
+          if (body.includes('##')) {
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Security: Dependency vulnerabilities detected',
+              body: body,
+              labels: ['security', 'dependencies']
+            });
+          }
+

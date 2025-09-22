@@ -1,0 +1,309 @@
+name: Performance Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * 0'  # Run weekly on Sundays at 2 AM
+
+jobs:
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: test_inventory_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install Dependencies
+      working-directory: ./backend
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install locust pytest-benchmark
+
+    - name: Set up environment variables
+      run: |
+        echo "DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/test_inventory_db" >> $GITHUB_ENV
+        echo "REDIS_URL=redis://localhost:6379/0" >> $GITHUB_ENV
+        echo "SECRET_KEY=test-secret-key-for-performance" >> $GITHUB_ENV
+        echo "DEBUG=false" >> $GITHUB_ENV
+
+    - name: Run Database Migrations
+      working-directory: ./backend
+      run: |
+        alembic upgrade head
+
+    - name: Start Backend Server
+      working-directory: ./backend
+      run: |
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        sleep 10
+
+    - name: Run Load Tests
+      working-directory: ./backend
+      run: |
+        # Create a simple load test script
+        cat > load_test.py << 'EOF'
+        import asyncio
+        import aiohttp
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        
+        async def make_request(session, url):
+            try:
+                async with session.get(url) as response:
+                    return await response.text()
+            except Exception as e:
+                return str(e)
+        
+        async def load_test():
+            urls = [
+                "http://localhost:8000/health",
+                "http://localhost:8000/api/v1/inventory/items",
+                "http://localhost:8000/api/v1/suppliers/",
+                "http://localhost:8000/api/v1/orders/"
+            ]
+            
+            async with aiohttp.ClientSession() as session:
+                start_time = time.time()
+                tasks = []
+                
+                # Create 100 concurrent requests
+                for _ in range(100):
+                    for url in urls:
+                        tasks.append(make_request(session, url))
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                end_time = time.time()
+                
+                successful_requests = sum(1 for r in results if not isinstance(r, Exception))
+                total_requests = len(results)
+                duration = end_time - start_time
+                rps = total_requests / duration
+                
+                print(f"Total requests: {total_requests}")
+                print(f"Successful requests: {successful_requests}")
+                print(f"Failed requests: {total_requests - successful_requests}")
+                print(f"Duration: {duration:.2f} seconds")
+                print(f"Requests per second: {rps:.2f}")
+                
+                # Fail if success rate is below 95%
+                success_rate = successful_requests / total_requests
+                if success_rate < 0.95:
+                    print(f"ERROR: Success rate {success_rate:.2%} is below 95%")
+                    exit(1)
+                
+                # Fail if RPS is below 10
+                if rps < 10:
+                    print(f"ERROR: RPS {rps:.2f} is below 10")
+                    exit(1)
+        
+        if __name__ == "__main__":
+            asyncio.run(load_test())
+        EOF
+        
+        python load_test.py
+
+    - name: Run Memory Profiling
+      working-directory: ./backend
+      run: |
+        pip install memory-profiler psutil
+        python -m memory_profiler -o memory_profile.txt -c "import app.main"
+
+    - name: Run Database Performance Tests
+      working-directory: ./backend
+      run: |
+        cat > db_performance_test.py << 'EOF'
+        import asyncio
+        import time
+        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+        from app.models.inventory import InventoryItem
+        from app.models.supplier import Supplier
+        from app.models.user import User
+        from app.core.security import get_password_hash
+        import os
+        
+        async def db_performance_test():
+            DATABASE_URL = os.getenv("DATABASE_URL")
+            engine = create_async_engine(DATABASE_URL)
+            SessionLocal = async_sessionmaker(engine)
+            
+            async with SessionLocal() as session:
+                # Test bulk insert performance
+                start_time = time.time()
+                
+                # Create test suppliers
+                suppliers = []
+                for i in range(100):
+                    supplier = Supplier(
+                        name=f"Supplier {i}",
+                        email=f"supplier{i}@example.com",
+                        is_active=True
+                    )
+                    suppliers.append(supplier)
+                
+                session.add_all(suppliers)
+                await session.commit()
+                
+                # Create test inventory items
+                items = []
+                for i in range(1000):
+                    item = InventoryItem(
+                        sku=f"SKU-{i:06d}",
+                        name=f"Item {i}",
+                        unit_price=10.0 + i,
+                        quantity_in_stock=100,
+                        category="electronics"
+                    )
+                    items.append(item)
+                
+                session.add_all(items)
+                await session.commit()
+                
+                end_time = time.time()
+                print(f"Bulk insert of 100 suppliers and 1000 items took {end_time - start_time:.2f} seconds")
+                
+                # Test query performance
+                start_time = time.time()
+                
+                # Test complex query
+                from sqlalchemy import select, func
+                result = await session.execute(
+                    select(InventoryItem)
+                    .where(InventoryItem.quantity_in_stock < 50)
+                    .limit(100)
+                )
+                items = result.scalars().all()
+                
+                end_time = time.time()
+                print(f"Complex query returned {len(items)} items in {end_time - start_time:.2f} seconds")
+                
+                # Test aggregation query
+                start_time = time.time()
+                
+                result = await session.execute(
+                    select(func.count(InventoryItem.id), func.sum(InventoryItem.quantity_in_stock))
+                )
+                count, total_stock = result.first()
+                
+                end_time = time.time()
+                print(f"Aggregation query took {end_time - start_time:.2f} seconds")
+                print(f"Total items: {count}, Total stock: {total_stock}")
+        
+        if __name__ == "__main__":
+            asyncio.run(db_performance_test())
+        EOF
+        
+        python db_performance_test.py
+
+    - name: Upload Performance Reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-reports
+        path: |
+          backend/memory_profile.txt
+
+  lighthouse-audit:
+    name: Lighthouse Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install Frontend Dependencies
+      working-directory: ./frontend
+      run: npm ci
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: npm run build
+
+    - name: Run Lighthouse CI
+      uses: treosh/lighthouse-ci-action@v10
+      with:
+        configPath: './.lighthouserc.json'
+        uploadArtifacts: true
+        temporaryPublicStorage: true
+
+    - name: Comment PR with Lighthouse Results
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          try {
+            const reportPath = path.join(process.cwd(), '.lighthouseci');
+            const files = fs.readdirSync(reportPath);
+            const jsonFile = files.find(file => file.endsWith('.json'));
+            
+            if (jsonFile) {
+              const report = JSON.parse(fs.readFileSync(path.join(reportPath, jsonFile), 'utf8'));
+              const summary = report.summary;
+              
+              let comment = '## 🚀 Lighthouse Performance Report\n\n';
+              comment += '| Metric | Score |\n';
+              comment += '|--------|-------|\n';
+              comment += `| Performance | ${summary.performance} |\n`;
+              comment += `| Accessibility | ${summary.accessibility} |\n`;
+              comment += `| Best Practices | ${summary['best-practices']} |\n`;
+              comment += `| SEO | ${summary.seo} |\n`;
+              
+              if (summary.performance < 90) {
+                comment += '\n⚠️ **Performance score is below 90. Consider optimizing.**\n';
+              }
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+          } catch (error) {
+            console.log('Could not generate Lighthouse report comment:', error);
+          }
+
