@@ -66,6 +66,7 @@ jobs:
         npm audit --audit-level=moderate  # Show issues in console
 
     - name: Run Snyk Security Scan
+      if: ${{ secrets.SNYK_TOKEN }}
       uses: snyk/actions/node@master
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
