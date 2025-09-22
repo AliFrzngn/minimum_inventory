@@ -4,8 +4,7 @@ import {
   Package, 
   ShoppingCart, 
   Users, 
-  Building2,
-  Settings
+  Building2
 } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 
