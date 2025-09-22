@@ -3,7 +3,8 @@ Application configuration settings using Pydantic v2.
 """
 
 from typing import List, Optional
-from pydantic import BaseSettings, validator
+from pydantic_settings import BaseSettings
+from pydantic import field_validator
 import os
 
 
@@ -52,7 +53,8 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
     UPLOAD_DIR: str = "uploads"
     
-    @validator("ALLOWED_HOSTS", pre=True)
+    @field_validator("ALLOWED_HOSTS", mode="before")
+    @classmethod
     def assemble_cors_origins(cls, v):
         if isinstance(v, str) and not v.startswith("["):
             return [i.strip() for i in v.split(",")]
@@ -60,10 +62,12 @@ class Settings(BaseSettings):
             return v
         raise ValueError(v)
     
-    @validator("DATABASE_URL", pre=True)
-    def assemble_db_connection(cls, v, values):
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def assemble_db_connection(cls, v, info):
         if isinstance(v, str):
             return v
+        values = info.data if info else {}
         return f"postgresql+asyncpg://{values.get('DB_USER', 'user')}:{values.get('DB_PASSWORD', 'password')}@{values.get('DB_HOST', 'localhost')}:{values.get('DB_PORT', 5432)}/{values.get('DB_NAME', 'inventory_db')}"
     
     class Config:
